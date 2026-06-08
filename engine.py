@@ -1,21 +1,20 @@
 """
-engine.py -- Renko Trading Engine v2.7
-Supports ITM/OTM option selection + embedded chart data
+engine.py -- Renko Trading Engine v3.0
+ATM/ITM/OTM strike selection, position adoption, multi-instrument ready
 """
-import os, sys, io, csv, time, json, struct, threading, logging
-from datetime import datetime, timedelta, timezone
+import os,sys,io,csv,time,json,struct,threading,logging
+from datetime import datetime,timedelta,timezone
 from dataclasses import dataclass
-from typing import Dict, Optional, List, Callable
+from typing import Dict,Optional,List
 from pathlib import Path
-import requests, pyotp, websocket
-from dotenv import load_dotenv, set_key
+import requests,pyotp,websocket
+from dotenv import load_dotenv,set_key
 
-log = logging.getLogger("RENKO")
-IST = timezone(timedelta(hours=5, minutes=30))
-
-if getattr(sys, 'frozen', False): BASE_DIR = Path(sys.executable).parent
-else: BASE_DIR = Path(__file__).resolve().parent
-ENV_FILE = BASE_DIR / ".env"
+log=logging.getLogger("RENKO")
+IST=timezone(timedelta(hours=5,minutes=30))
+if getattr(sys,'frozen',False): BASE_DIR=Path(sys.executable).parent
+else: BASE_DIR=Path(__file__).resolve().parent
+ENV_FILE=BASE_DIR/".env"
 
 def now_ist(): return datetime.now(IST)
 def _norm_epoch(ts):
@@ -34,67 +33,58 @@ DHAN_INSTRUMENT_API="https://api.dhan.co/v2/instrument"
 REQ_SUB_TICKER=15;REQ_UNSUB_TICKER=16;RESP_TICKER=2
 EXCH_SEG_MAP={0:"IDX_I",1:"NSE_EQ",2:"NSE_FNO",3:"NSE_CURRENCY",4:"BSE_EQ",5:"MCX_COMM",7:"BSE_CURRENCY",8:"BSE_FNO"}
 
-# ===================================================================
-# INSTRUMENTS
-# ===================================================================
-# strike_mode: "ITM" or "OTM"
-#   ITM: BUY->CE below spot, SELL->PE above spot (higher delta, pricier)
-#   OTM: BUY->CE above spot, SELL->PE below spot (lower delta, cheaper)
+# strike_mode: "ATM" / "ITM" / "OTM"
+# ATM: trade at-the-money (offset ignored)
+# ITM: CE below spot, PE above spot (deeper = higher delta)
+# OTM: CE above spot, PE below spot (cheaper premium)
 
 INSTRUMENTS = {
     "NIFTY": {
         "security_id":"","segment":"NSE_FNO","instrument":"FUTIDX","exch_for_ws":"NSE_FNO",
         "symbol_root":"NIFTY","inst_filter":"FUTIDX","brick_size":30,"reversal":2,
-        "label":"NIFTY SPOT","trade_type":"options","itm_offset":100,"strike_gap":50,
-        "strike_mode":"ITM",
+        "label":"NIFTY SPOT","trade_type":"options","strike_mode":"ITM","itm_offset":100,"strike_gap":50,
         "lot_size":75,"lots":1,"trade_mode":"paper","index_security_id":"13","index_segment":"IDX_I",
         "target_points":0,"daily_profit_target":0,
     },
     "BANKNIFTY": {
         "security_id":"","segment":"NSE_FNO","instrument":"FUTIDX","exch_for_ws":"NSE_FNO",
         "symbol_root":"BANKNIFTY","inst_filter":"FUTIDX","brick_size":50,"reversal":2,
-        "label":"BANKNIFTY SPOT","trade_type":"options","itm_offset":200,"strike_gap":100,
-        "strike_mode":"ITM",
+        "label":"BANKNIFTY SPOT","trade_type":"options","strike_mode":"ITM","itm_offset":200,"strike_gap":100,
         "lot_size":30,"lots":1,"trade_mode":"paper","index_security_id":"25","index_segment":"IDX_I",
         "target_points":0,"daily_profit_target":0,
     },
     "SENSEX": {
         "security_id":"","segment":"BSE_FNO","instrument":"FUTIDX","exch_for_ws":"BSE_FNO",
         "symbol_root":"SENSEX","inst_filter":"FUTIDX","brick_size":100,"reversal":2,
-        "label":"SENSEX SPOT","trade_type":"options","itm_offset":300,"strike_gap":100,
-        "strike_mode":"ITM",
+        "label":"SENSEX SPOT","trade_type":"options","strike_mode":"ITM","itm_offset":300,"strike_gap":100,
         "lot_size":10,"lots":1,"trade_mode":"paper","index_security_id":"51","index_segment":"IDX_I",
         "target_points":0,"daily_profit_target":0,
     },
     "GOLDPETAL": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"GOLDPETAL","inst_filter":"FUTCOM","brick_size":5,"reversal":2,
-        "label":"GOLDPETAL (MCX)","trade_type":"futures","itm_offset":0,"strike_gap":0,
-        "strike_mode":"ITM",
+        "label":"GOLDPETAL (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
         "lot_size":100,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
         "target_points":0,"daily_profit_target":0,
     },
     "SILVERMICRO": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"SILVERM","inst_filter":"FUTCOM","brick_size":50,"reversal":2,
-        "label":"SILVERMICRO (MCX)","trade_type":"futures","itm_offset":0,"strike_gap":0,
-        "strike_mode":"ITM",
+        "label":"SILVERMICRO (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
         "lot_size":100,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
         "target_points":0,"daily_profit_target":0,
     },
     "CRUDEOILM": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"CRUDEOILM","inst_filter":"FUTCOM","brick_size":5,"reversal":2,
-        "label":"CRUDEOIL MINI (MCX)","trade_type":"futures","itm_offset":0,"strike_gap":0,
-        "strike_mode":"ITM",
+        "label":"CRUDEOIL MINI (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
         "lot_size":10,"lots":1,"trade_mode":"live","index_security_id":"","index_segment":"",
         "target_points":10,"daily_profit_target":500,
     },
     "GOLDM": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"GOLDM","inst_filter":"FUTCOM","brick_size":50,"reversal":2,
-        "label":"GOLD MINI (MCX)","trade_type":"futures","itm_offset":0,"strike_gap":0,
-        "strike_mode":"ITM",
+        "label":"GOLD MINI (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
         "lot_size":10,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
         "target_points":0,"daily_profit_target":0,
     },
@@ -120,7 +110,7 @@ class DhanTokenManager:
             totp=pyotp.TOTP(self.totp_secret).now();log.info(f"TOTP attempt {a+1}: {totp}")
             try:
                 d=requests.post(AUTH_GENERATE_URL,params={"dhanClientId":self.client_id,"pin":self.pin,"totp":totp},timeout=15).json()
-                if "accessToken" in d: log.info("Token generated"); return d["accessToken"]
+                if "accessToken" in d: return d["accessToken"]
             except Exception as e: log.warning(f"Gen err: {e}");time.sleep(2)
         return None
     def ensure_token(self):
@@ -134,8 +124,7 @@ def get_signal_config(key):
     inst=INSTRUMENTS[key]
     if inst["trade_type"]=="options" and inst.get("index_security_id"):
         return inst["index_security_id"],inst.get("index_segment","IDX_I"),"INDEX"
-    else:
-        return inst["security_id"],inst["segment"],inst["instrument"]
+    return inst["security_id"],inst["segment"],inst["instrument"]
 
 class DhanAPI:
     def __init__(self): self.headers={}
@@ -146,7 +135,7 @@ class DhanAPI:
             try:
                 r=requests.post(f"{BASE_URL}{ep}",headers=self.headers,json=payload,timeout=15)
                 if r.status_code==200: return r.json()
-                log.warning(f"API {ep} -> {r.status_code}: {r.text[:200]}")
+                log.warning(f"API {ep}->{r.status_code}: {r.text[:200]}")
             except Exception as e: log.error(f"API {ep}: {e}")
             if a<retries: time.sleep(1)
         return None
@@ -158,13 +147,13 @@ class DhanAPI:
             except: pass
             if a<retries: time.sleep(1)
         return None
-api = DhanAPI()
+api=DhanAPI()
 
-def resolve_security_ids(active_keys):
+def resolve_security_ids(keys):
     today=datetime.now(IST).date()
-    futures_keys=[k for k in active_keys if INSTRUMENTS.get(k,{}).get("trade_type")=="futures"]
-    if not futures_keys: return
-    needed={INSTRUMENTS[k]["segment"] for k in futures_keys}
+    fkeys=[k for k in keys if INSTRUMENTS.get(k,{}).get("trade_type")=="futures"]
+    if not fkeys: return
+    needed={INSTRUMENTS[k]["segment"] for k in fkeys}
     seg_rows={}
     for seg in needed:
         rows=[]
@@ -173,7 +162,7 @@ def resolve_security_ids(active_keys):
             if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
         except: pass
         seg_rows[seg]=rows
-    for key in futures_keys:
+    for key in fkeys:
         inst=INSTRUMENTS.get(key)
         if not inst: continue
         rows=seg_rows.get(inst["segment"],[])
@@ -233,7 +222,7 @@ def get_nearest_expiry(idx_name):
     valid.sort(); return valid[0][1] if valid else None
 
 def resolve_option(inst_key,direction):
-    """Resolve option strike based on strike_mode (ITM or OTM)."""
+    """Resolve option strike based on strike_mode: ATM, ITM, or OTM."""
     inst=INSTRUMENTS[inst_key];idx_name=inst["symbol_root"]
     idx_sid=inst.get("index_security_id","")
     if not idx_sid: return None
@@ -242,16 +231,16 @@ def resolve_option(inst_key,direction):
     resp=api.post("/optionchain",{"UnderlyingScrip":int(idx_sid),"UnderlyingSeg":"IDX_I","Expiry":expiry})
     if not resp or resp.get("status")!="success": return None
     spot=float(resp["data"]["last_price"]);oc=resp["data"]["oc"]
-    atm=round(spot/inst["strike_gap"])*inst["strike_gap"]
-    offset=inst["itm_offset"]
-    mode=inst.get("strike_mode","ITM").upper()
+    gap=inst["strike_gap"];atm=round(spot/gap)*gap
+    offset=inst["itm_offset"];mode=inst.get("strike_mode","ITM").upper()
 
-    if mode=="ITM":
-        # ITM CE = below spot, ITM PE = above spot
+    if mode=="ATM":
+        if direction==1: tgt=atm;ot="CE"
+        else: tgt=atm;ot="PE"
+    elif mode=="ITM":
         if direction==1: tgt=atm-offset;ot="CE"
         else: tgt=atm+offset;ot="PE"
-    else:  # OTM
-        # OTM CE = above spot, OTM PE = below spot
+    else: # OTM
         if direction==1: tgt=atm+offset;ot="CE"
         else: tgt=atm-offset;ot="PE"
 
@@ -264,14 +253,14 @@ def resolve_option(inst_key,direction):
     ok="ce" if ot=="CE" else "pe"
     if key not in oc or ok not in oc[key]: return None
     od=oc[key][ok]
-    log.info(f"  Resolved {idx_name} {int(tgt)}{ot} ({mode}) | SecID={od['security_id']} | LTP={od.get('last_price',0)}")
+    log.info(f"  {idx_name} {int(tgt)}{ot} ({mode}) | LTP={od.get('last_price',0)} | Spot={spot:.0f}")
     return {"security_id":str(od["security_id"]),"strike":tgt,"option_type":ot,"last_price":float(od.get("last_price",0)),"expiry":expiry}
 
 def place_order(client_id,security_id,exchange_segment,qty,buy_sell,max_retries=3):
     payload={"dhanClientId":client_id,"transactionType":buy_sell,"exchangeSegment":exchange_segment,"productType":"INTRADAY","orderType":"MARKET","validity":"DAY","securityId":str(security_id),"quantity":int(qty),"price":0,"triggerPrice":0,"disclosedQuantity":0,"afterMarketOrder":False}
     order_id=None
     for a in range(max_retries):
-        log.info(f"ORDER | {buy_sell} {qty} | SecID={security_id} | Attempt {a+1}")
+        log.info(f"ORDER|{buy_sell} {qty}|SecID={security_id}|Attempt {a+1}")
         resp=api.post("/orders",payload,retries=0)
         if resp:
             resp=_ensure_dict(resp)
@@ -299,6 +288,11 @@ def place_order(client_id,security_id,exchange_segment,qty,buy_sell,max_retries=
                 if fp>0: fill=fp;break
         except: pass
     return order_id,fill
+
+def get_broker_positions():
+    resp=api.get("/positions")
+    if not resp or not isinstance(resp,list): return []
+    return [p for p in resp if isinstance(p,dict) and int(p.get("netQty",0))!=0]
 
 def parse_header_8(msg):
     if len(msg)<8: return None
@@ -350,8 +344,7 @@ class RenkoEngine:
         for c in candles:
             ts=datetime.fromtimestamp(c["timestamp"],tz=IST) if c["timestamp"] else now_ist()
             self.process_price(float(c["close"]),ts)
-        self.on_brick_callback=cb
-        return len(self.bricks)
+        self.on_brick_callback=cb; return len(self.bricks)
     def get_last_n(self,n):
         with self.lock: return list(self.bricks[-n:]) if self.bricks else []
 
@@ -385,6 +378,21 @@ class TradeManager:
         t=self.current_trade
         if t and t.is_open and self.inst["trade_type"]=="futures": t.current_ltp=ltp
 
+    def adopt_position(self,security_id,direction,qty,entry_price,option_type="FUT",strike=0.0,expiry=""):
+        """Adopt an existing broker position as if we entered it."""
+        tp=self.inst.get("target_points",0)
+        tgt_p=(entry_price+tp) if direction==1 and tp>0 else (entry_price-tp) if direction==-1 and tp>0 else 0.0
+        trade=Trade(instrument_key=self.inst_key,direction=direction,option_type=option_type,
+                    security_id=str(security_id),strike=strike,entry_price=entry_price,
+                    entry_time=now_ist(),qty=abs(qty),expiry=expiry,target_price=tgt_p)
+        self.current_trade=trade;self.trade_count+=1
+        self.last_brick_color="green" if direction==1 else "red"
+        if self._ws_sub:
+            exch="NSE_FNO" if self.inst["trade_type"]=="options" else self.inst["exch_for_ws"]
+            self._ws_sub(str(security_id),exch,self.inst_key)
+        log.info(f"  ADOPTED | {'LONG' if direction==1 else 'SHORT'} {option_type} | SecID={security_id} | Entry={entry_price:.2f} | Qty={abs(qty)}")
+        self._notify("entry",{"direction":direction,"type":option_type,"strike":strike,"price":entry_price,"target":tgt_p,"qty":abs(qty),"mode":"ADOPTED"})
+
     def check_target(self,ltp):
         if not self.enable_trading or self.squaredoff or self.daily_target_reached or self._order_in_progress: return
         t=self.current_trade
@@ -413,7 +421,7 @@ class TradeManager:
         self._notify("daily_target",{"pnl":self.total_pnl})
         t=self.current_trade
         if t and t.is_open:
-            ep,oid=self._place_exit(t,t.current_ltp if t.current_ltp>0 else t.entry_price)
+            ep,_=self._place_exit(t,t.current_ltp if t.current_ltp>0 else t.entry_price)
             pp=(ep-t.entry_price) if t.direction==1 else (t.entry_price-ep)
             t.exit_price=ep;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason="DAILY_TGT"
             self.total_pnl+=t.pnl;self.trade_history.append(t)
@@ -423,7 +431,7 @@ class TradeManager:
             with self.order_lock:
                 t=self.current_trade
                 if not t or not t.is_open: return
-                d=t.direction;ep,oid=self._place_exit(t,ltp)
+                d=t.direction;ep,_=self._place_exit(t,ltp)
                 pp=(ep-t.entry_price) if d==1 else (t.entry_price-ep)
                 t.exit_price=ep;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason="TARGET"
                 self.total_pnl+=t.pnl;self.trade_history.append(t)
@@ -448,7 +456,7 @@ class TradeManager:
                         self.waiting_for_reversal=False;self.waiting_direction=0
                         self._do_enter(new_dir,brick)
                 else: self._do_enter(new_dir,brick)
-        except Exception as e: log.error(f"Brick signal err: {e}")
+        except Exception as e: log.error(f"Brick err: {e}")
         finally: self._order_in_progress=False
 
     def _do_enter(self,direction,brick):
@@ -456,13 +464,13 @@ class TradeManager:
         if inst["trade_type"]=="options":
             opt=resolve_option(self.inst_key,direction)
             if not opt: return
-            sec_id=opt["security_id"];strike=opt["strike"];ot=opt["option_type"];ep=opt["last_price"];exp=opt["expiry"];oid=""
+            sec_id=opt["security_id"];strike=opt["strike"];ot=opt["option_type"];ep=opt["last_price"];exp=opt["expiry"]
             if mode=="live":
                 oid,fp=place_order(self.client_id,sec_id,"NSE_FNO",qty,"BUY")
                 if not oid: return
                 if fp>0: ep=fp
         elif inst["trade_type"]=="futures":
-            sec_id=inst["security_id"];strike=0;ot="FUT";ep=brick.close;exp="";oid=""
+            sec_id=inst["security_id"];strike=0;ot="FUT";ep=brick.close;exp=""
             if mode=="live":
                 oid,fp=place_order(self.client_id,sec_id,inst["exch_for_ws"],qty,"BUY" if direction==1 else "SELL")
                 if not oid: return
@@ -481,7 +489,7 @@ class TradeManager:
     def _do_exit(self,brick,reason):
         t=self.current_trade
         if not t or not t.is_open: return
-        ep,oid=self._place_exit(t,brick.close)
+        ep,_=self._place_exit(t,brick.close)
         pp=(ep-t.entry_price) if t.direction==1 else (t.entry_price-ep)
         t.exit_price=ep;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason=reason
         self.total_pnl+=t.pnl;self.trade_history.append(t)
@@ -491,21 +499,21 @@ class TradeManager:
         self._notify("exit",{"reason":reason,"pnl":t.pnl,"total":self.total_pnl})
 
     def _place_exit(self,t,fallback):
-        inst=self.inst;mode=inst["trade_mode"];oid=""
+        inst=self.inst;mode=inst["trade_mode"]
         ep=t.current_ltp if t.current_ltp>0 else fallback
         if mode=="live":
             if inst["trade_type"]=="options":
-                oid,fp=place_order(self.client_id,t.security_id,"NSE_FNO",t.qty,"SELL")
+                _,fp=place_order(self.client_id,t.security_id,"NSE_FNO",t.qty,"SELL")
             else:
-                oid,fp=place_order(self.client_id,t.security_id,inst["exch_for_ws"],t.qty,"SELL" if t.direction==1 else "BUY")
+                _,fp=place_order(self.client_id,t.security_id,inst["exch_for_ws"],t.qty,"SELL" if t.direction==1 else "BUY")
             if fp>0: ep=fp
-        return ep,oid
+        return ep,""
 
     def squareoff(self):
         with self.order_lock:
             t=self.current_trade
             if not t or not t.is_open: self.squaredoff=True;return
-            ep,oid=self._place_exit(t,t.entry_price)
+            ep,_=self._place_exit(t,t.entry_price)
             pp=(ep-t.entry_price) if t.direction==1 else (t.entry_price-ep)
             t.exit_price=ep;t.exit_time=now_ist();t.exit_reason="SQUAREOFF";t.pnl=pp*t.qty;t.is_open=False
             self.total_pnl+=t.pnl;self.trade_history.append(t);self.squaredoff=True
