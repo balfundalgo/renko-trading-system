@@ -1,6 +1,6 @@
 """
-engine.py -- Renko Trading Engine v3.1
-Auto lot size from Dhan API + ATM/ITM/OTM + position adoption
+engine.py -- Renko Trading Engine v3.2
+Auto lot size on startup, ATM/ITM/OTM, position adoption, multi-instrument
 """
 import os,sys,io,csv,time,json,struct,threading,logging
 from datetime import datetime,timedelta,timezone
@@ -33,7 +33,6 @@ DHAN_INSTRUMENT_API="https://api.dhan.co/v2/instrument"
 REQ_SUB_TICKER=15;REQ_UNSUB_TICKER=16;RESP_TICKER=2
 EXCH_SEG_MAP={0:"IDX_I",1:"NSE_EQ",2:"NSE_FNO",3:"NSE_CURRENCY",4:"BSE_EQ",5:"MCX_COMM",7:"BSE_CURRENCY",8:"BSE_FNO"}
 
-# strike_mode: "ATM" / "ITM" / "OTM"
 INSTRUMENTS = {
     "NIFTY": {
         "security_id":"","segment":"NSE_FNO","instrument":"FUTIDX","exch_for_ws":"NSE_FNO",
@@ -145,18 +144,7 @@ class DhanAPI:
         return None
 api=DhanAPI()
 
-def _fetch_segment_csv(seg):
-    """Fetch instrument CSV for a segment. Returns list of dicts."""
-    rows=[]
-    try:
-        r=requests.get(f"{DHAN_INSTRUMENT_API}/{seg}",headers=api.headers,timeout=60)
-        if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
-    except: pass
-    if rows: log.info(f"  {seg}: {len(rows)} instruments")
-    return rows
-
 def _detect_col(rows,candidates):
-    """Auto-detect column name from a list of candidates."""
     if not rows: return ""
     s=rows[0]
     for c in candidates:
@@ -166,39 +154,85 @@ def _detect_col(rows,candidates):
             if cd.upper().replace("_","") in c.upper().replace("_",""): return c
     return ""
 
-def resolve_instruments(keys):
-    """Resolve security_ids (for futures) AND lot_sizes (for all) from Dhan CSV.
-    For options instruments, lot_size is fetched from the nearest futures contract."""
+def fetch_all_lot_sizes():
+    """Fetch lot sizes for ALL instruments from Dhan API. Call once after token is ready.
+    Returns dict of {key: lot_size} for GUI update."""
     today=datetime.now(IST).date()
-    # Figure out which segments we need
     needed_segs=set()
-    for k in keys:
-        inst=INSTRUMENTS.get(k)
-        if not inst: continue
+    for k,inst in INSTRUMENTS.items():
         needed_segs.add(inst["segment"])
-    # Fetch CSVs
     seg_rows={}
     for seg in needed_segs:
-        seg_rows[seg]=_fetch_segment_csv(seg)
-
-    for key in keys:
-        inst=INSTRUMENTS.get(key)
-        if not inst: continue
+        rows=[]
+        try:
+            r=requests.get(f"{DHAN_INSTRUMENT_API}/{seg}",headers=api.headers,timeout=60)
+            if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
+        except: pass
+        seg_rows[seg]=rows
+        if rows: log.info(f"  Lot fetch {seg}: {len(rows)} instruments")
+    result={}
+    for key,inst in INSTRUMENTS.items():
         rows=seg_rows.get(inst["segment"],[])
         if not rows: continue
-
         cs=_detect_col(rows,["SEM_TRADING_SYMBOL","SM_SYMBOL_NAME","SYMBOL_NAME"])
         ci=_detect_col(rows,["SEM_INSTRUMENT_NAME","INSTRUMENT"])
         cid=_detect_col(rows,["SEM_SMST_SECURITY_ID","SECURITY_ID"])
         ce=_detect_col(rows,["SEM_EXPIRY_DATE","SM_EXPIRY_DATE"])
         cc=_detect_col(rows,["SEM_CUSTOM_SYMBOL","DISPLAY_NAME"])
         cl=_detect_col(rows,["SEM_LOT_UNITS","SM_MARKET_LOT","LOT_SIZE","LOT_UNITS"])
+        if not all([cs,ci,ce,cl]): continue
+        cands=[]
+        for row in rows:
+            sym=row.get(cs,"").strip();ins=row.get(ci,"").strip();exp=row.get(ce,"").strip()
+            sid=row.get(cid,"").strip()
+            cust=row.get(cc,"").strip() if cc else ""
+            lot_str=row.get(cl,"0").strip()
+            if ins!=inst["inst_filter"]: continue
+            if not (sym.startswith(inst["symbol_root"]) or cust.startswith(inst["symbol_root"])): continue
+            ed=None
+            for fmt in ("%Y-%m-%d","%Y-%m-%d %H:%M:%S","%d-%m-%Y","%d/%m/%Y","%d-%b-%Y"):
+                try: ed=datetime.strptime(exp.split(" ")[0],fmt).date(); break
+                except: continue
+            if not ed or ed<today: continue
+            try: lv=int(float(lot_str))
+            except: lv=0
+            if lv>0: cands.append({"expiry":ed,"lot":lv,"sid":sid,"sym":sym or cust})
+        if not cands: continue
+        cands.sort(key=lambda x:x["expiry"]);ch=cands[0]
+        inst["lot_size"]=ch["lot"]
+        if inst["trade_type"]=="futures": inst["security_id"]=str(ch["sid"])
+        result[key]=ch["lot"]
+        log.info(f"  {key}: Lot={ch['lot']} | {ch['sym']} | Exp={ch['expiry'].strftime('%d-%b')}")
+    return result
 
+def resolve_instruments(keys):
+    """Resolve security_ids + lot_sizes for specific keys (called on START)."""
+    today=datetime.now(IST).date()
+    needed_segs=set()
+    for k in keys: needed_segs.add(INSTRUMENTS[k]["segment"])
+    seg_rows={}
+    for seg in needed_segs:
+        rows=[]
+        try:
+            r=requests.get(f"{DHAN_INSTRUMENT_API}/{seg}",headers=api.headers,timeout=60)
+            if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
+        except: pass
+        seg_rows[seg]=rows
+    for key in keys:
+        inst=INSTRUMENTS.get(key)
+        if not inst: continue
+        rows=seg_rows.get(inst["segment"],[])
+        if not rows: continue
+        cs=_detect_col(rows,["SEM_TRADING_SYMBOL","SM_SYMBOL_NAME","SYMBOL_NAME"])
+        ci=_detect_col(rows,["SEM_INSTRUMENT_NAME","INSTRUMENT"])
+        cid=_detect_col(rows,["SEM_SMST_SECURITY_ID","SECURITY_ID"])
+        ce=_detect_col(rows,["SEM_EXPIRY_DATE","SM_EXPIRY_DATE"])
+        cc=_detect_col(rows,["SEM_CUSTOM_SYMBOL","DISPLAY_NAME"])
+        cl=_detect_col(rows,["SEM_LOT_UNITS","SM_MARKET_LOT","LOT_SIZE"])
         if not all([cs,ci,cid,ce]): continue
         cands=[]
         for row in rows:
-            sym=row.get(cs,"").strip();ins=row.get(ci,"").strip()
-            sid=row.get(cid,"").strip();exp=row.get(ce,"").strip()
+            sym=row.get(cs,"").strip();ins=row.get(ci,"").strip();sid=row.get(cid,"").strip();exp=row.get(ce,"").strip()
             cust=row.get(cc,"").strip() if cc else ""
             lot_str=row.get(cl,"0").strip() if cl else "0"
             if ins!=inst["inst_filter"]: continue
@@ -208,22 +242,14 @@ def resolve_instruments(keys):
                 try: ed=datetime.strptime(exp.split(" ")[0],fmt).date(); break
                 except: continue
             if not ed or ed<today: continue
-            try: lot_val=int(float(lot_str))
-            except: lot_val=0
-            cands.append({"security_id":sid,"trading_symbol":sym or cust,"expiry_date":ed,"lot_size":lot_val})
+            try: lv=int(float(lot_str))
+            except: lv=0
+            cands.append({"security_id":sid,"trading_symbol":sym or cust,"expiry_date":ed,"lot_size":lv})
         if not cands: continue
         cands.sort(key=lambda x:x["expiry_date"]);ch=cands[0]
-
-        # Set security_id for futures
-        if inst["trade_type"]=="futures":
-            inst["security_id"]=str(ch["security_id"])
-
-        # Set lot_size (auto-fetched overrides default)
-        if ch["lot_size"]>0:
-            inst["lot_size"]=ch["lot_size"]
-            log.info(f"  {key}: {ch['trading_symbol']} | SecID={ch['security_id']} | Lot={ch['lot_size']} | Exp={ch['expiry_date'].strftime('%d-%b-%Y')}")
-        else:
-            log.info(f"  {key}: {ch['trading_symbol']} | SecID={ch['security_id']} | Lot=? (using default {inst['lot_size']})")
+        if inst["trade_type"]=="futures": inst["security_id"]=str(ch["security_id"])
+        if ch["lot_size"]>0: inst["lot_size"]=ch["lot_size"]
+        log.info(f"  {key}: {ch['trading_symbol']} | SecID={ch['security_id']} | Lot={inst['lot_size']}")
 
 def fetch_historical(sid,seg,inst_type,days=5):
     to_d=now_ist().strftime("%Y-%m-%d");fr_d=(now_ist()-timedelta(days=days)).strftime("%Y-%m-%d")
@@ -259,8 +285,7 @@ def resolve_option(inst_key,direction):
     spot=float(resp["data"]["last_price"]);oc=resp["data"]["oc"]
     gap=inst["strike_gap"];atm=round(spot/gap)*gap
     offset=inst["itm_offset"];mode=inst.get("strike_mode","ITM").upper()
-    if mode=="ATM":
-        tgt=atm;ot="CE" if direction==1 else "PE"
+    if mode=="ATM": tgt=atm;ot="CE" if direction==1 else "PE"
     elif mode=="ITM":
         if direction==1: tgt=atm-offset;ot="CE"
         else: tgt=atm+offset;ot="PE"
@@ -276,7 +301,6 @@ def resolve_option(inst_key,direction):
     ok="ce" if ot=="CE" else "pe"
     if key not in oc or ok not in oc[key]: return None
     od=oc[key][ok]
-    log.info(f"  {idx_name} {int(tgt)}{ot}({mode})|LTP={od.get('last_price',0)}|Spot={spot:.0f}")
     return {"security_id":str(od["security_id"]),"strike":tgt,"option_type":ot,"last_price":float(od.get("last_price",0)),"expiry":expiry}
 
 def place_order(client_id,security_id,exchange_segment,qty,buy_sell,max_retries=3):
@@ -412,10 +436,8 @@ class TradeManager:
         if not self.enable_trading or self.squaredoff or self.daily_target_reached or self._order_in_progress: return
         t=self.current_trade
         if not t or not t.is_open or t.target_price<=0: return
-        hit=(t.direction==1 and ltp>=t.target_price) or (t.direction==-1 and ltp<=t.target_price)
-        if hit:
-            self._order_in_progress=True
-            self._notify("target_hit",{"ltp":ltp})
+        if (t.direction==1 and ltp>=t.target_price) or (t.direction==-1 and ltp<=t.target_price):
+            self._order_in_progress=True;self._notify("target_hit",{"ltp":ltp})
             threading.Thread(target=self._bg_target_exit,args=(ltp,),daemon=True).start()
     def on_brick(self,brick,key):
         if not self.enable_trading or key!=self.inst_key or self.squaredoff or self.daily_target_reached: return
@@ -423,8 +445,7 @@ class TradeManager:
         if color==self.last_brick_color: return
         self.last_brick_color=color
         if self._order_in_progress: return
-        self._order_in_progress=True
-        new_dir=1 if color=="green" else -1
+        self._order_in_progress=True;new_dir=1 if color=="green" else -1
         self._notify("signal",{"direction":new_dir,"brick_close":brick.close})
         threading.Thread(target=self._bg_brick_signal,args=(new_dir,brick),daemon=True).start()
     def _check_daily_target(self):
@@ -459,8 +480,7 @@ class TradeManager:
                 if has_open:
                     self._do_exit(brick,"REVERSAL");self._check_daily_target()
                     if self.daily_target_reached: return
-                    self.waiting_for_reversal=False;self.waiting_direction=0
-                    self._do_enter(new_dir,brick)
+                    self.waiting_for_reversal=False;self.waiting_direction=0;self._do_enter(new_dir,brick)
                 elif is_w:
                     if new_dir!=wd: self.waiting_for_reversal=False;self.waiting_direction=0;self._do_enter(new_dir,brick)
                 else: self._do_enter(new_dir,brick)
@@ -468,7 +488,7 @@ class TradeManager:
         finally: self._order_in_progress=False
     def _do_enter(self,direction,brick):
         inst=self.inst;mode=inst["trade_mode"];qty=inst["lot_size"]*inst["lots"]
-        if qty<=0: log.error(f"  {self.inst_key}: lot_size is 0! Cannot trade"); return
+        if qty<=0: log.error(f"  {self.inst_key}: lot_size=0, cannot trade");return
         if inst["trade_type"]=="options":
             opt=resolve_option(self.inst_key,direction)
             if not opt: return
