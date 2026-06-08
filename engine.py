@@ -1,6 +1,6 @@
 """
-engine.py -- Renko Trading Engine v3.0
-ATM/ITM/OTM strike selection, position adoption, multi-instrument ready
+engine.py -- Renko Trading Engine v3.1
+Auto lot size from Dhan API + ATM/ITM/OTM + position adoption
 """
 import os,sys,io,csv,time,json,struct,threading,logging
 from datetime import datetime,timedelta,timezone
@@ -34,58 +34,54 @@ REQ_SUB_TICKER=15;REQ_UNSUB_TICKER=16;RESP_TICKER=2
 EXCH_SEG_MAP={0:"IDX_I",1:"NSE_EQ",2:"NSE_FNO",3:"NSE_CURRENCY",4:"BSE_EQ",5:"MCX_COMM",7:"BSE_CURRENCY",8:"BSE_FNO"}
 
 # strike_mode: "ATM" / "ITM" / "OTM"
-# ATM: trade at-the-money (offset ignored)
-# ITM: CE below spot, PE above spot (deeper = higher delta)
-# OTM: CE above spot, PE below spot (cheaper premium)
-
 INSTRUMENTS = {
     "NIFTY": {
         "security_id":"","segment":"NSE_FNO","instrument":"FUTIDX","exch_for_ws":"NSE_FNO",
         "symbol_root":"NIFTY","inst_filter":"FUTIDX","brick_size":30,"reversal":2,
         "label":"NIFTY SPOT","trade_type":"options","strike_mode":"ITM","itm_offset":100,"strike_gap":50,
-        "lot_size":75,"lots":1,"trade_mode":"paper","index_security_id":"13","index_segment":"IDX_I",
+        "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"13","index_segment":"IDX_I",
         "target_points":0,"daily_profit_target":0,
     },
     "BANKNIFTY": {
         "security_id":"","segment":"NSE_FNO","instrument":"FUTIDX","exch_for_ws":"NSE_FNO",
         "symbol_root":"BANKNIFTY","inst_filter":"FUTIDX","brick_size":50,"reversal":2,
         "label":"BANKNIFTY SPOT","trade_type":"options","strike_mode":"ITM","itm_offset":200,"strike_gap":100,
-        "lot_size":30,"lots":1,"trade_mode":"paper","index_security_id":"25","index_segment":"IDX_I",
+        "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"25","index_segment":"IDX_I",
         "target_points":0,"daily_profit_target":0,
     },
     "SENSEX": {
         "security_id":"","segment":"BSE_FNO","instrument":"FUTIDX","exch_for_ws":"BSE_FNO",
         "symbol_root":"SENSEX","inst_filter":"FUTIDX","brick_size":100,"reversal":2,
         "label":"SENSEX SPOT","trade_type":"options","strike_mode":"ITM","itm_offset":300,"strike_gap":100,
-        "lot_size":10,"lots":1,"trade_mode":"paper","index_security_id":"51","index_segment":"IDX_I",
+        "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"51","index_segment":"IDX_I",
         "target_points":0,"daily_profit_target":0,
     },
     "GOLDPETAL": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"GOLDPETAL","inst_filter":"FUTCOM","brick_size":5,"reversal":2,
         "label":"GOLDPETAL (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
-        "lot_size":100,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
+        "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
         "target_points":0,"daily_profit_target":0,
     },
     "SILVERMICRO": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"SILVERM","inst_filter":"FUTCOM","brick_size":50,"reversal":2,
         "label":"SILVERMICRO (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
-        "lot_size":100,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
+        "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
         "target_points":0,"daily_profit_target":0,
     },
     "CRUDEOILM": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"CRUDEOILM","inst_filter":"FUTCOM","brick_size":5,"reversal":2,
         "label":"CRUDEOIL MINI (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
-        "lot_size":10,"lots":1,"trade_mode":"live","index_security_id":"","index_segment":"",
+        "lot_size":0,"lots":1,"trade_mode":"live","index_security_id":"","index_segment":"",
         "target_points":10,"daily_profit_target":500,
     },
     "GOLDM": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"GOLDM","inst_filter":"FUTCOM","brick_size":50,"reversal":2,
         "label":"GOLD MINI (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
-        "lot_size":10,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
+        "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
         "target_points":0,"daily_profit_target":0,
     },
 }
@@ -149,42 +145,62 @@ class DhanAPI:
         return None
 api=DhanAPI()
 
-def resolve_security_ids(keys):
+def _fetch_segment_csv(seg):
+    """Fetch instrument CSV for a segment. Returns list of dicts."""
+    rows=[]
+    try:
+        r=requests.get(f"{DHAN_INSTRUMENT_API}/{seg}",headers=api.headers,timeout=60)
+        if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
+    except: pass
+    if rows: log.info(f"  {seg}: {len(rows)} instruments")
+    return rows
+
+def _detect_col(rows,candidates):
+    """Auto-detect column name from a list of candidates."""
+    if not rows: return ""
+    s=rows[0]
+    for c in candidates:
+        if c in s: return c
+    for c in s:
+        for cd in candidates:
+            if cd.upper().replace("_","") in c.upper().replace("_",""): return c
+    return ""
+
+def resolve_instruments(keys):
+    """Resolve security_ids (for futures) AND lot_sizes (for all) from Dhan CSV.
+    For options instruments, lot_size is fetched from the nearest futures contract."""
     today=datetime.now(IST).date()
-    fkeys=[k for k in keys if INSTRUMENTS.get(k,{}).get("trade_type")=="futures"]
-    if not fkeys: return
-    needed={INSTRUMENTS[k]["segment"] for k in fkeys}
+    # Figure out which segments we need
+    needed_segs=set()
+    for k in keys:
+        inst=INSTRUMENTS.get(k)
+        if not inst: continue
+        needed_segs.add(inst["segment"])
+    # Fetch CSVs
     seg_rows={}
-    for seg in needed:
-        rows=[]
-        try:
-            r=requests.get(f"{DHAN_INSTRUMENT_API}/{seg}",headers=api.headers,timeout=60)
-            if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
-        except: pass
-        seg_rows[seg]=rows
-    for key in fkeys:
+    for seg in needed_segs:
+        seg_rows[seg]=_fetch_segment_csv(seg)
+
+    for key in keys:
         inst=INSTRUMENTS.get(key)
         if not inst: continue
         rows=seg_rows.get(inst["segment"],[])
         if not rows: continue
-        s=rows[0]
-        def _f(cs):
-            for c in cs:
-                if c in s: return c
-            for c in s:
-                for cd in cs:
-                    if cd.upper().replace("_","") in c.upper().replace("_",""): return c
-            return ""
-        cs=_f(["SEM_TRADING_SYMBOL","SM_SYMBOL_NAME","SYMBOL_NAME"])
-        ci=_f(["SEM_INSTRUMENT_NAME","INSTRUMENT"])
-        cid=_f(["SEM_SMST_SECURITY_ID","SECURITY_ID"])
-        ce=_f(["SEM_EXPIRY_DATE","SM_EXPIRY_DATE"])
-        cc=_f(["SEM_CUSTOM_SYMBOL","DISPLAY_NAME"])
+
+        cs=_detect_col(rows,["SEM_TRADING_SYMBOL","SM_SYMBOL_NAME","SYMBOL_NAME"])
+        ci=_detect_col(rows,["SEM_INSTRUMENT_NAME","INSTRUMENT"])
+        cid=_detect_col(rows,["SEM_SMST_SECURITY_ID","SECURITY_ID"])
+        ce=_detect_col(rows,["SEM_EXPIRY_DATE","SM_EXPIRY_DATE"])
+        cc=_detect_col(rows,["SEM_CUSTOM_SYMBOL","DISPLAY_NAME"])
+        cl=_detect_col(rows,["SEM_LOT_UNITS","SM_MARKET_LOT","LOT_SIZE","LOT_UNITS"])
+
         if not all([cs,ci,cid,ce]): continue
         cands=[]
         for row in rows:
-            sym=row.get(cs,"").strip();ins=row.get(ci,"").strip();sid=row.get(cid,"").strip();exp=row.get(ce,"").strip()
+            sym=row.get(cs,"").strip();ins=row.get(ci,"").strip()
+            sid=row.get(cid,"").strip();exp=row.get(ce,"").strip()
             cust=row.get(cc,"").strip() if cc else ""
+            lot_str=row.get(cl,"0").strip() if cl else "0"
             if ins!=inst["inst_filter"]: continue
             if not (sym.startswith(inst["symbol_root"]) or cust.startswith(inst["symbol_root"])): continue
             ed=None
@@ -192,11 +208,22 @@ def resolve_security_ids(keys):
                 try: ed=datetime.strptime(exp.split(" ")[0],fmt).date(); break
                 except: continue
             if not ed or ed<today: continue
-            cands.append({"security_id":sid,"trading_symbol":sym or cust,"expiry_date":ed})
+            try: lot_val=int(float(lot_str))
+            except: lot_val=0
+            cands.append({"security_id":sid,"trading_symbol":sym or cust,"expiry_date":ed,"lot_size":lot_val})
         if not cands: continue
         cands.sort(key=lambda x:x["expiry_date"]);ch=cands[0]
-        inst["security_id"]=str(ch["security_id"])
-        log.info(f"  {key}: {ch['trading_symbol']} | SecID={ch['security_id']}")
+
+        # Set security_id for futures
+        if inst["trade_type"]=="futures":
+            inst["security_id"]=str(ch["security_id"])
+
+        # Set lot_size (auto-fetched overrides default)
+        if ch["lot_size"]>0:
+            inst["lot_size"]=ch["lot_size"]
+            log.info(f"  {key}: {ch['trading_symbol']} | SecID={ch['security_id']} | Lot={ch['lot_size']} | Exp={ch['expiry_date'].strftime('%d-%b-%Y')}")
+        else:
+            log.info(f"  {key}: {ch['trading_symbol']} | SecID={ch['security_id']} | Lot=? (using default {inst['lot_size']})")
 
 def fetch_historical(sid,seg,inst_type,days=5):
     to_d=now_ist().strftime("%Y-%m-%d");fr_d=(now_ist()-timedelta(days=days)).strftime("%Y-%m-%d")
@@ -222,7 +249,6 @@ def get_nearest_expiry(idx_name):
     valid.sort(); return valid[0][1] if valid else None
 
 def resolve_option(inst_key,direction):
-    """Resolve option strike based on strike_mode: ATM, ITM, or OTM."""
     inst=INSTRUMENTS[inst_key];idx_name=inst["symbol_root"]
     idx_sid=inst.get("index_security_id","")
     if not idx_sid: return None
@@ -233,27 +259,24 @@ def resolve_option(inst_key,direction):
     spot=float(resp["data"]["last_price"]);oc=resp["data"]["oc"]
     gap=inst["strike_gap"];atm=round(spot/gap)*gap
     offset=inst["itm_offset"];mode=inst.get("strike_mode","ITM").upper()
-
     if mode=="ATM":
-        if direction==1: tgt=atm;ot="CE"
-        else: tgt=atm;ot="PE"
+        tgt=atm;ot="CE" if direction==1 else "PE"
     elif mode=="ITM":
         if direction==1: tgt=atm-offset;ot="CE"
         else: tgt=atm+offset;ot="PE"
-    else: # OTM
+    else:
         if direction==1: tgt=atm+offset;ot="CE"
         else: tgt=atm-offset;ot="PE"
-
     key=None
     for k in oc:
         try:
             if abs(float(k)-tgt)<0.01: key=k; break
         except: pass
-    if not key: log.error(f"  {idx_name}: Strike {tgt}{ot} not in OC"); return None
+    if not key: return None
     ok="ce" if ot=="CE" else "pe"
     if key not in oc or ok not in oc[key]: return None
     od=oc[key][ok]
-    log.info(f"  {idx_name} {int(tgt)}{ot} ({mode}) | LTP={od.get('last_price',0)} | Spot={spot:.0f}")
+    log.info(f"  {idx_name} {int(tgt)}{ot}({mode})|LTP={od.get('last_price',0)}|Spot={spot:.0f}")
     return {"security_id":str(od["security_id"]),"strike":tgt,"option_type":ot,"last_price":float(od.get("last_price",0)),"expiry":expiry}
 
 def place_order(client_id,security_id,exchange_segment,qty,buy_sell,max_retries=3):
@@ -365,34 +388,26 @@ class TradeManager:
         self.gui_cb=gui_cb;self.squaredoff=False;self.waiting_for_reversal=False
         self.waiting_direction=0;self._order_in_progress=False;self.daily_target_reached=False
         self.enable_trading=True
-
     def _notify(self,event,data=None):
         if self.gui_cb:
             try: self.gui_cb(event,self.inst_key,data)
             except: pass
-
     def update_ltp(self,sid,ltp):
         t=self.current_trade
         if t and t.is_open and t.security_id==sid: t.current_ltp=ltp
     def update_signal_ltp(self,ltp):
         t=self.current_trade
         if t and t.is_open and self.inst["trade_type"]=="futures": t.current_ltp=ltp
-
     def adopt_position(self,security_id,direction,qty,entry_price,option_type="FUT",strike=0.0,expiry=""):
-        """Adopt an existing broker position as if we entered it."""
         tp=self.inst.get("target_points",0)
         tgt_p=(entry_price+tp) if direction==1 and tp>0 else (entry_price-tp) if direction==-1 and tp>0 else 0.0
-        trade=Trade(instrument_key=self.inst_key,direction=direction,option_type=option_type,
-                    security_id=str(security_id),strike=strike,entry_price=entry_price,
-                    entry_time=now_ist(),qty=abs(qty),expiry=expiry,target_price=tgt_p)
+        trade=Trade(instrument_key=self.inst_key,direction=direction,option_type=option_type,security_id=str(security_id),strike=strike,entry_price=entry_price,entry_time=now_ist(),qty=abs(qty),expiry=expiry,target_price=tgt_p)
         self.current_trade=trade;self.trade_count+=1
         self.last_brick_color="green" if direction==1 else "red"
         if self._ws_sub:
             exch="NSE_FNO" if self.inst["trade_type"]=="options" else self.inst["exch_for_ws"]
             self._ws_sub(str(security_id),exch,self.inst_key)
-        log.info(f"  ADOPTED | {'LONG' if direction==1 else 'SHORT'} {option_type} | SecID={security_id} | Entry={entry_price:.2f} | Qty={abs(qty)}")
         self._notify("entry",{"direction":direction,"type":option_type,"strike":strike,"price":entry_price,"target":tgt_p,"qty":abs(qty),"mode":"ADOPTED"})
-
     def check_target(self,ltp):
         if not self.enable_trading or self.squaredoff or self.daily_target_reached or self._order_in_progress: return
         t=self.current_trade
@@ -402,7 +417,6 @@ class TradeManager:
             self._order_in_progress=True
             self._notify("target_hit",{"ltp":ltp})
             threading.Thread(target=self._bg_target_exit,args=(ltp,),daemon=True).start()
-
     def on_brick(self,brick,key):
         if not self.enable_trading or key!=self.inst_key or self.squaredoff or self.daily_target_reached: return
         color="green" if brick.is_green else "red"
@@ -413,19 +427,16 @@ class TradeManager:
         new_dir=1 if color=="green" else -1
         self._notify("signal",{"direction":new_dir,"brick_close":brick.close})
         threading.Thread(target=self._bg_brick_signal,args=(new_dir,brick),daemon=True).start()
-
     def _check_daily_target(self):
         dpt=self.inst.get("daily_profit_target",0)
         if dpt<=0 or self.total_pnl<dpt: return
-        self.daily_target_reached=True
-        self._notify("daily_target",{"pnl":self.total_pnl})
+        self.daily_target_reached=True;self._notify("daily_target",{"pnl":self.total_pnl})
         t=self.current_trade
         if t and t.is_open:
             ep,_=self._place_exit(t,t.current_ltp if t.current_ltp>0 else t.entry_price)
             pp=(ep-t.entry_price) if t.direction==1 else (t.entry_price-ep)
             t.exit_price=ep;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason="DAILY_TGT"
             self.total_pnl+=t.pnl;self.trade_history.append(t)
-
     def _bg_target_exit(self,ltp):
         try:
             with self.order_lock:
@@ -438,9 +449,8 @@ class TradeManager:
                 self.waiting_for_reversal=True;self.waiting_direction=d
                 self._notify("exit",{"reason":"TARGET","pnl":t.pnl,"total":self.total_pnl})
                 self._check_daily_target()
-        except Exception as e: log.error(f"Target exit err: {e}")
+        except Exception as e: log.error(f"Target err: {e}")
         finally: self._order_in_progress=False
-
     def _bg_brick_signal(self,new_dir,brick):
         try:
             with self.order_lock:
@@ -452,15 +462,13 @@ class TradeManager:
                     self.waiting_for_reversal=False;self.waiting_direction=0
                     self._do_enter(new_dir,brick)
                 elif is_w:
-                    if new_dir!=wd:
-                        self.waiting_for_reversal=False;self.waiting_direction=0
-                        self._do_enter(new_dir,brick)
+                    if new_dir!=wd: self.waiting_for_reversal=False;self.waiting_direction=0;self._do_enter(new_dir,brick)
                 else: self._do_enter(new_dir,brick)
         except Exception as e: log.error(f"Brick err: {e}")
         finally: self._order_in_progress=False
-
     def _do_enter(self,direction,brick):
         inst=self.inst;mode=inst["trade_mode"];qty=inst["lot_size"]*inst["lots"]
+        if qty<=0: log.error(f"  {self.inst_key}: lot_size is 0! Cannot trade"); return
         if inst["trade_type"]=="options":
             opt=resolve_option(self.inst_key,direction)
             if not opt: return
@@ -483,9 +491,7 @@ class TradeManager:
         if self._ws_sub:
             exch="NSE_FNO" if inst["trade_type"]=="options" else inst["exch_for_ws"]
             self._ws_sub(sec_id,exch,self.inst_key)
-        sm=inst.get("strike_mode","ITM")
-        self._notify("entry",{"direction":direction,"type":ot,"strike":strike,"price":ep,"target":tgt_p,"qty":qty,"mode":sm})
-
+        self._notify("entry",{"direction":direction,"type":ot,"strike":strike,"price":ep,"target":tgt_p,"qty":qty,"mode":inst.get("strike_mode","")})
     def _do_exit(self,brick,reason):
         t=self.current_trade
         if not t or not t.is_open: return
@@ -497,18 +503,14 @@ class TradeManager:
             exch="NSE_FNO" if self.inst["trade_type"]=="options" else self.inst["exch_for_ws"]
             self._ws_unsub(t.security_id,exch)
         self._notify("exit",{"reason":reason,"pnl":t.pnl,"total":self.total_pnl})
-
     def _place_exit(self,t,fallback):
         inst=self.inst;mode=inst["trade_mode"]
         ep=t.current_ltp if t.current_ltp>0 else fallback
         if mode=="live":
-            if inst["trade_type"]=="options":
-                _,fp=place_order(self.client_id,t.security_id,"NSE_FNO",t.qty,"SELL")
-            else:
-                _,fp=place_order(self.client_id,t.security_id,inst["exch_for_ws"],t.qty,"SELL" if t.direction==1 else "BUY")
+            if inst["trade_type"]=="options": _,fp=place_order(self.client_id,t.security_id,"NSE_FNO",t.qty,"SELL")
+            else: _,fp=place_order(self.client_id,t.security_id,inst["exch_for_ws"],t.qty,"SELL" if t.direction==1 else "BUY")
             if fp>0: ep=fp
         return ep,""
-
     def squareoff(self):
         with self.order_lock:
             t=self.current_trade
@@ -518,7 +520,6 @@ class TradeManager:
             t.exit_price=ep;t.exit_time=now_ist();t.exit_reason="SQUAREOFF";t.pnl=pp*t.qty;t.is_open=False
             self.total_pnl+=t.pnl;self.trade_history.append(t);self.squaredoff=True
             self._notify("squareoff",{"pnl":t.pnl,"total":self.total_pnl})
-
     def get_unrealized_pnl(self):
         t=self.current_trade
         if not t or not t.is_open or t.current_ltp<=0: return 0.0
