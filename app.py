@@ -11,7 +11,7 @@ else: BASE_DIR=Path(__file__).resolve().parent
 sys.path.insert(0,str(BASE_DIR))
 
 from engine import (INSTRUMENTS,DhanTokenManager,DhanAPI,api,resolve_instruments,fetch_all_lot_sizes,
-    fetch_historical,get_signal_config,RenkoEngine,TradeManager,get_broker_positions,
+    fetch_historical,get_signal_config,RenkoEngine,TradeManager,get_broker_positions,find_exit_price_from_tradebook,
     parse_header_8,parse_ticker,_norm_epoch,now_ist,ENV_FILE,IST,
     REQ_SUB_TICKER,REQ_UNSUB_TICKER,RESP_TICKER)
 from dotenv import load_dotenv,set_key
@@ -463,7 +463,50 @@ class App(ctk.CTk):
                 self.after(0,lambda:self._dlog(f"{name} | SQUAREOFF | PnL={data['total']:+.2f}"))
         except: pass
 
-    def _start_timers(self): self._refresh_dash();self._redraw_chart();self._check_sq()
+    def _start_timers(self): self._refresh_dash();self._redraw_chart();self._check_sq();self._position_sync()
+    def _position_sync(self):
+        """Every 10s, check broker positions. If our open trade is gone, reconcile exit price."""
+        try:
+            if not self.running_keys: self.after(10000,self._position_sync);return
+            # Only call API if we have instruments with open trades
+            has_open=False
+            for key in list(self.running_keys):
+                tm=self.trade_managers.get(key)
+                if tm and tm.current_trade and tm.current_trade.is_open: has_open=True;break
+            if not has_open: self.after(10000,self._position_sync);return
+            # Fetch broker positions in background thread to avoid freezing GUI
+            threading.Thread(target=self._do_position_sync,daemon=True).start()
+        except: pass
+        self.after(10000,self._position_sync)
+    def _do_position_sync(self):
+        """Background thread: fetch positions and reconcile."""
+        try:
+            broker_pos=get_broker_positions()  # only positions with netQty!=0
+            broker_sids={str(p.get("securityId","")) for p in broker_pos}
+            for key in list(self.running_keys):
+                tm=self.trade_managers.get(key)
+                if not tm: continue
+                t=tm.current_trade
+                if not t or not t.is_open: continue
+                inst=INSTRUMENTS.get(key,{})
+                # Check if our trade's security_id still has an open position at broker
+                if t.security_id in broker_sids: continue  # still open, all good
+                # Position gone at broker! Reconcile exit price from tradebook
+                exit_price=find_exit_price_from_tradebook(t.security_id,t.direction)
+                if exit_price<=0: exit_price=t.current_ltp if t.current_ltp>0 else t.entry_price
+                # Calculate PnL
+                if inst.get("trade_type")=="options":
+                    pp=exit_price-t.entry_price
+                else:
+                    pp=(exit_price-t.entry_price) if t.direction==1 else (t.entry_price-exit_price)
+                t.exit_price=exit_price;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason="EXTERNAL"
+                tm.total_pnl+=t.pnl;tm.trade_history.append(t)
+                tm.waiting_for_reversal=False;tm.waiting_direction=0
+                name=inst.get("label",key)
+                self.after(0,lambda n=name,ep=exit_price,pnl=t.pnl,tot=tm.total_pnl:
+                    self._dlog(f"{n} | EXTERNAL CLOSE detected | Exit={ep:.2f} | PnL={pnl:+.2f} | Total={tot:+.2f}"))
+        except Exception as e:
+            log.error(f"PosSync err: {e}")
     def _check_sq(self):
         if not self._sq_done and self.running_keys:
             n=now_ist()

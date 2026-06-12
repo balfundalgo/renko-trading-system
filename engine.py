@@ -341,6 +341,29 @@ def get_broker_positions():
     if not resp or not isinstance(resp,list): return []
     return [p for p in resp if isinstance(p,dict) and int(p.get("netQty",0))!=0]
 
+def get_today_tradebook():
+    """Fetch today's tradebook (all fills). Returns list of trade dicts."""
+    resp=api.get("/trades")
+    if not resp or not isinstance(resp,list): return []
+    return [t for t in resp if isinstance(t,dict)]
+
+def find_exit_price_from_tradebook(security_id, direction):
+    """Find the most recent exit fill price for a security_id from today's tradebook.
+    For LONG positions, exit is SELL. For SHORT positions, exit is BUY."""
+    trades=get_today_tradebook()
+    if not trades: return 0.0
+    exit_side="SELL" if direction==1 else "BUY"
+    matching=[]
+    for t in trades:
+        if str(t.get("securityId",""))==str(security_id) and t.get("transactionType","")==exit_side:
+            matching.append(t)
+    if not matching: return 0.0
+    # Sort by trade time (most recent first) and return the latest fill price
+    # Use tradedTime or createTime if available, otherwise just take the last one
+    latest=matching[-1]
+    try: return float(latest.get("tradedPrice",0))
+    except: return 0.0
+
 def parse_header_8(msg):
     if len(msg)<8: return None
     return {"resp_code":msg[0],"security_id":str(struct.unpack_from("<I",msg,4)[0]),"payload":msg[8:]}
@@ -427,7 +450,7 @@ class TradeManager:
         tgt_p=(entry_price+tp) if direction==1 and tp>0 else (entry_price-tp) if direction==-1 and tp>0 else 0.0
         trade=Trade(instrument_key=self.inst_key,direction=direction,option_type=option_type,security_id=str(security_id),strike=strike,entry_price=entry_price,entry_time=now_ist(),qty=abs(qty),expiry=expiry,target_price=tgt_p)
         self.current_trade=trade;self.trade_count+=1
-        self.last_brick_color="green" if direction==1 else "red"
+        self.last_brick_color=None  # let the first new brick decide: match=keep, mismatch=reverse
         if self._ws_sub:
             exch="NSE_FNO" if self.inst["trade_type"]=="options" else self.inst["exch_for_ws"]
             self._ws_sub(str(security_id),exch,self.inst_key)
@@ -478,6 +501,10 @@ class TradeManager:
                 has_open=self.current_trade and self.current_trade.is_open
                 is_w=self.waiting_for_reversal;wd=self.waiting_direction
                 if has_open:
+                    if new_dir==self.current_trade.direction:
+                        # Brick matches existing position — keep trade (adopted position confirmed)
+                        log.info(f"  {self.inst_key}: Brick confirms position direction, keeping trade")
+                        return
                     self._do_exit(brick,"REVERSAL");self._check_daily_target()
                     if self.daily_target_reached: return
                     self.waiting_for_reversal=False;self.waiting_direction=0;self._do_enter(new_dir,brick)
