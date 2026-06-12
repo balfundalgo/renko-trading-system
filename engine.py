@@ -455,7 +455,7 @@ class TradeManager:
         t=self.current_trade
         if t and t.is_open:
             ep,_=self._place_exit(t,t.current_ltp if t.current_ltp>0 else t.entry_price)
-            pp=(ep-t.entry_price) if t.direction==1 else (t.entry_price-ep)
+            pp=(ep-t.entry_price) if (self.inst["trade_type"]=="options" or t.direction==1) else (t.entry_price-ep)
             t.exit_price=ep;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason="DAILY_TGT"
             self.total_pnl+=t.pnl;self.trade_history.append(t)
     def _bg_target_exit(self,ltp):
@@ -464,7 +464,7 @@ class TradeManager:
                 t=self.current_trade
                 if not t or not t.is_open: return
                 d=t.direction;ep,_=self._place_exit(t,ltp)
-                pp=(ep-t.entry_price) if d==1 else (t.entry_price-ep)
+                pp=(ep-t.entry_price) if (self.inst["trade_type"]=="options" or d==1) else (t.entry_price-ep)
                 t.exit_price=ep;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason="TARGET"
                 self.total_pnl+=t.pnl;self.trade_history.append(t)
                 self.waiting_for_reversal=True;self.waiting_direction=d
@@ -516,7 +516,7 @@ class TradeManager:
         t=self.current_trade
         if not t or not t.is_open: return
         ep,_=self._place_exit(t,brick.close)
-        pp=(ep-t.entry_price) if t.direction==1 else (t.entry_price-ep)
+        pp=(ep-t.entry_price) if (self.inst["trade_type"]=="options" or t.direction==1) else (t.entry_price-ep)
         t.exit_price=ep;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason=reason
         self.total_pnl+=t.pnl;self.trade_history.append(t)
         if self._ws_unsub:
@@ -536,7 +536,7 @@ class TradeManager:
             t=self.current_trade
             if not t or not t.is_open: self.squaredoff=True;return
             ep,_=self._place_exit(t,t.entry_price)
-            pp=(ep-t.entry_price) if t.direction==1 else (t.entry_price-ep)
+            pp=(ep-t.entry_price) if (self.inst["trade_type"]=="options" or t.direction==1) else (t.entry_price-ep)
             t.exit_price=ep;t.exit_time=now_ist();t.exit_reason="SQUAREOFF";t.pnl=pp*t.qty;t.is_open=False
             self.total_pnl+=t.pnl;self.trade_history.append(t);self.squaredoff=True
             self._notify("squareoff",{"pnl":t.pnl,"total":self.total_pnl})
