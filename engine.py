@@ -452,7 +452,7 @@ class TradeManager:
         self.current_trade=trade;self.trade_count+=1
         self.last_brick_color=None  # let the first new brick decide: match=keep, mismatch=reverse
         if self._ws_sub:
-            exch="NSE_FNO" if self.inst["trade_type"]=="options" else self.inst["exch_for_ws"]
+            exch=self.inst["segment"] if self.inst["trade_type"]=="options" else self.inst["exch_for_ws"]
             self._ws_sub(str(security_id),exch,self.inst_key)
         self._notify("entry",{"direction":direction,"type":option_type,"strike":strike,"price":entry_price,"target":tgt_p,"qty":abs(qty),"mode":"ADOPTED"})
     def check_target(self,ltp):
@@ -521,7 +521,7 @@ class TradeManager:
             if not opt: return
             sec_id=opt["security_id"];strike=opt["strike"];ot=opt["option_type"];ep=opt["last_price"];exp=opt["expiry"]
             if mode=="live":
-                oid,fp=place_order(self.client_id,sec_id,"NSE_FNO",qty,"BUY")
+                oid,fp=place_order(self.client_id,sec_id,inst["segment"],qty,"BUY")
                 if not oid: return
                 if fp>0: ep=fp
         elif inst["trade_type"]=="futures":
@@ -536,7 +536,7 @@ class TradeManager:
         trade=Trade(instrument_key=self.inst_key,direction=direction,option_type=ot,security_id=sec_id,strike=strike,entry_price=ep,entry_time=brick.time,qty=qty,expiry=exp,target_price=tgt_p)
         self.current_trade=trade;self.trade_count+=1
         if self._ws_sub:
-            exch="NSE_FNO" if inst["trade_type"]=="options" else inst["exch_for_ws"]
+            exch=self.inst["segment"] if inst["trade_type"]=="options" else inst["exch_for_ws"]
             self._ws_sub(sec_id,exch,self.inst_key)
         self._notify("entry",{"direction":direction,"type":ot,"strike":strike,"price":ep,"target":tgt_p,"qty":qty,"mode":inst.get("strike_mode","")})
     def _do_exit(self,brick,reason):
@@ -547,14 +547,14 @@ class TradeManager:
         t.exit_price=ep;t.exit_time=now_ist();t.pnl=pp*t.qty;t.is_open=False;t.exit_reason=reason
         self.total_pnl+=t.pnl;self.trade_history.append(t)
         if self._ws_unsub:
-            exch="NSE_FNO" if self.inst["trade_type"]=="options" else self.inst["exch_for_ws"]
+            exch=self.inst["segment"] if self.inst["trade_type"]=="options" else self.inst["exch_for_ws"]
             self._ws_unsub(t.security_id,exch)
         self._notify("exit",{"reason":reason,"pnl":t.pnl,"total":self.total_pnl})
     def _place_exit(self,t,fallback):
         inst=self.inst;mode=inst["trade_mode"]
         ep=t.current_ltp if t.current_ltp>0 else fallback
         if mode=="live":
-            if inst["trade_type"]=="options": _,fp=place_order(self.client_id,t.security_id,"NSE_FNO",t.qty,"SELL")
+            if inst["trade_type"]=="options": _,fp=place_order(self.client_id,t.security_id,self.inst["segment"],t.qty,"SELL")
             else: _,fp=place_order(self.client_id,t.security_id,inst["exch_for_ws"],t.qty,"SELL" if t.direction==1 else "BUY")
             if fp>0: ep=fp
         return ep,""
