@@ -302,11 +302,14 @@ class App(ctk.CTk):
 
     def _ws_loop(self):
         url=f"wss://api-feed.dhan.co?version=2&token={self.access_token}&clientId={self.client_id}&authType=2"
-        backoff=0
+        backoff=0;connect_time=0
         while not self.ws_stop.is_set():
+            # Sleep if no instruments running (don't hammer Dhan with empty connections)
+            if not self.running_keys:
+                time.sleep(5);continue
             try:
                 def _open(ws):
-                    nonlocal backoff;self.ws_connected.set();backoff=0
+                    nonlocal connect_time;self.ws_connected.set();connect_time=time.time()
                     insts=[]
                     for k in list(self.running_keys):
                         sid,seg,_=get_signal_config(k)
@@ -328,13 +331,26 @@ class App(ctk.CTk):
                             self.trade_managers[key].update_signal_ltp(ltp);self.trade_managers[key].check_target(ltp)
                     tk=self.trade_secid_to_key.get(sid)
                     if tk and tk in self.trade_managers: self.trade_managers[tk].update_ltp(sid,ltp)
-                def _err(ws,error): self.after(0,lambda:self._dlog(f"WS err: {error}"))
-                def _close(ws,sc,msg): self.ws_connected.clear()
+                def _err(ws,error):
+                    err_str=str(error)
+                    # Detect 429 and set long backoff
+                    if "429" in err_str:
+                        nonlocal backoff;backoff=99  # triggers 120s wait
+                    self.after(0,lambda:self._dlog(f"WS err: {error}"))
+                def _close(ws,sc,msg):
+                    nonlocal backoff,connect_time
+                    self.ws_connected.clear()
+                    # Only reset backoff if connection survived 30+ seconds
+                    if connect_time>0 and (time.time()-connect_time)>=30: backoff=0
                 self.ws=websocket.WebSocketApp(url,on_open=_open,on_message=_msg,on_error=_err,on_close=_close)
                 self.ws.run_forever(ping_interval=20,ping_timeout=10)
             except: pass
             finally:
-                if not self.ws_stop.is_set(): delay=min(2*(2**backoff),30);backoff+=1;time.sleep(delay)
+                if not self.ws_stop.is_set():
+                    if backoff>=99: delay=120  # 429 block: wait 2 minutes
+                    else: delay=min(2*(2**backoff),30)
+                    backoff=min(backoff+1,99)
+                    time.sleep(delay)
 
     def _ws_subscribe(self,sid,seg):
         if self.ws and self.ws_connected.is_set():
@@ -468,12 +484,14 @@ class App(ctk.CTk):
         """Every 10s, check broker positions. If our open trade is gone, reconcile exit price."""
         try:
             if not self.running_keys: self.after(10000,self._position_sync);return
-            # Only call API if we have instruments with open trades
-            has_open=False
+            # Only call API if we have live-mode instruments with open trades past 30s grace
+            has_live_open=False
             for key in list(self.running_keys):
-                tm=self.trade_managers.get(key)
-                if tm and tm.current_trade and tm.current_trade.is_open: has_open=True;break
-            if not has_open: self.after(10000,self._position_sync);return
+                tm=self.trade_managers.get(key);inst=INSTRUMENTS.get(key,{})
+                if tm and tm.current_trade and tm.current_trade.is_open and inst.get("trade_mode")=="live":
+                    if tm.current_trade.entry_time and (now_ist()-tm.current_trade.entry_time).total_seconds()>=30:
+                        has_live_open=True;break
+            if not has_live_open: self.after(10000,self._position_sync);return
             # Fetch broker positions in background thread to avoid freezing GUI
             threading.Thread(target=self._do_position_sync,daemon=True).start()
         except: pass
@@ -481,9 +499,22 @@ class App(ctk.CTk):
     def _do_position_sync(self):
         """Background thread: fetch positions and reconcile."""
         try:
+            # Collect keys that need checking (live mode + open trade + past grace period)
+            keys_to_check=[]
+            for key in list(self.running_keys):
+                tm=self.trade_managers.get(key);inst=INSTRUMENTS.get(key,{})
+                if not tm: continue
+                t=tm.current_trade
+                if not t or not t.is_open: continue
+                # Skip paper mode — no broker position exists
+                if inst.get("trade_mode")!="live": continue
+                # Skip if trade was entered less than 30 seconds ago (position may not appear yet)
+                if t.entry_time and (now_ist()-t.entry_time).total_seconds()<30: continue
+                keys_to_check.append(key)
+            if not keys_to_check: return
             broker_pos=get_broker_positions()  # only positions with netQty!=0
             broker_sids={str(p.get("securityId","")) for p in broker_pos}
-            for key in list(self.running_keys):
+            for key in keys_to_check:
                 tm=self.trade_managers.get(key)
                 if not tm: continue
                 t=tm.current_trade
