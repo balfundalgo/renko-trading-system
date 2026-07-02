@@ -60,28 +60,28 @@ INSTRUMENTS = {
         "symbol_root":"GOLDPETAL","inst_filter":"FUTCOM","brick_size":5,"reversal":2,
         "label":"GOLDPETAL (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
         "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
-        "target_points":0,"daily_profit_target":0,
+        "target_points":0,"daily_profit_target":0,"roll_days":6,
     },
     "SILVERMICRO": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"SILVERM","inst_filter":"FUTCOM","brick_size":50,"reversal":2,
         "label":"SILVERMICRO (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
         "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
-        "target_points":0,"daily_profit_target":0,
+        "target_points":0,"daily_profit_target":0,"roll_days":6,
     },
     "CRUDEOILM": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"CRUDEOILM","inst_filter":"FUTCOM","brick_size":5,"reversal":2,
         "label":"CRUDEOIL MINI (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
         "lot_size":0,"lots":1,"trade_mode":"live","index_security_id":"","index_segment":"",
-        "target_points":10,"daily_profit_target":500,
+        "target_points":10,"daily_profit_target":500,"roll_days":1,
     },
     "GOLDM": {
         "security_id":"","segment":"MCX_COMM","instrument":"FUTCOM","exch_for_ws":"MCX_COMM",
         "symbol_root":"GOLDM","inst_filter":"FUTCOM","brick_size":50,"reversal":2,
         "label":"GOLD MINI (MCX)","trade_type":"futures","strike_mode":"ATM","itm_offset":0,"strike_gap":0,
         "lot_size":0,"lots":1,"trade_mode":"paper","index_security_id":"","index_segment":"",
-        "target_points":0,"daily_profit_target":0,
+        "target_points":0,"daily_profit_target":0,"roll_days":6,
     },
 }
 
@@ -198,7 +198,20 @@ def fetch_all_lot_sizes():
             except: lv=0
             if lv>0: cands.append({"expiry":ed,"lot":lv,"sid":sid,"sym":sym or cust})
         if not cands: continue
-        cands.sort(key=lambda x:x["expiry"]);ch=cands[0]
+        cands.sort(key=lambda x:x["expiry"])
+        roll_days=inst.get("roll_days",0)
+        if roll_days>0:
+            safe=[c for c in cands if (c["expiry"]-today).days>roll_days]
+            if safe:
+                ch=safe[0]
+                if ch is not cands[0]:
+                    nd=(cands[0]["expiry"]-today).days
+                    log.info(f"  {key}: front {cands[0]['sym']} ({nd}d left) in tender buffer ({roll_days}d) -- rolling")
+            else:
+                ch=cands[0];nd=(ch["expiry"]-today).days
+                log.info(f"  {key}: WARNING {ch['sym']} ({nd}d left) within tender buffer ({roll_days}d)")
+        else:
+            ch=cands[0]
         inst["lot_size"]=ch["lot"]
         if inst["trade_type"]=="futures": inst["security_id"]=str(ch["sid"])
         result[key]=ch["lot"]
@@ -246,10 +259,24 @@ def resolve_instruments(keys):
             except: lv=0
             cands.append({"security_id":sid,"trading_symbol":sym or cust,"expiry_date":ed,"lot_size":lv})
         if not cands: continue
-        cands.sort(key=lambda x:x["expiry_date"]);ch=cands[0]
+        cands.sort(key=lambda x:x["expiry_date"])
+        roll_days=inst.get("roll_days",0)
+        if roll_days>0:
+            safe=[c for c in cands if (c["expiry_date"]-today).days>roll_days]
+            if safe:
+                ch=safe[0]
+                if ch is not cands[0]:
+                    nd=(cands[0]["expiry_date"]-today).days
+                    log.info(f"  {key}: front {cands[0]['trading_symbol']} ({nd}d left) in tender buffer ({roll_days}d) -- rolling")
+            else:
+                ch=cands[0];nd=(ch["expiry_date"]-today).days
+                log.info(f"  {key}: WARNING {ch['trading_symbol']} ({nd}d left) within tender buffer ({roll_days}d)")
+        else:
+            ch=cands[0]
         if inst["trade_type"]=="futures": inst["security_id"]=str(ch["security_id"])
         if ch["lot_size"]>0: inst["lot_size"]=ch["lot_size"]
-        log.info(f"  {key}: {ch['trading_symbol']} | SecID={ch['security_id']} | Lot={inst['lot_size']}")
+        days_left=(ch["expiry_date"]-today).days
+        log.info(f"  {key}: {ch['trading_symbol']} | SecID={ch['security_id']} | Lot={inst['lot_size']} | Exp={ch['expiry_date'].strftime('%d-%b')} ({days_left}d)")
 
 def fetch_historical(sid,seg,inst_type,days=5):
     to_d=now_ist().strftime("%Y-%m-%d");fr_d=(now_ist()-timedelta(days=days)).strftime("%Y-%m-%d")
