@@ -154,6 +154,35 @@ def _detect_col(rows,candidates):
             if cd.upper().replace("_","") in c.upper().replace("_",""): return c
     return ""
 
+# CSV cache: {segment: (timestamp, rows)}  — cached for 10 minutes
+_csv_cache={}
+_CSV_TTL=600  # 10 minutes
+
+def _get_segment_csv(seg):
+    """Fetch instrument CSV for a segment with caching. Returns list of dicts."""
+    now=time.time()
+    if seg in _csv_cache:
+        ts,rows=_csv_cache[seg]
+        if now-ts<_CSV_TTL and rows:
+            return rows
+    rows=[]
+    try:
+        r=requests.get(f"{DHAN_INSTRUMENT_API}/{seg}",headers=api.headers,timeout=60)
+        if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
+    except: pass
+    if rows:
+        _csv_cache[seg]=(now,rows)
+        log.info(f"  Fetched {seg}: {len(rows)} instruments")
+    return rows
+
+def _get_all_segment_csvs(segments):
+    """Fetch multiple segment CSVs with 1s gap between downloads to avoid rate limits."""
+    result={}
+    for seg in segments:
+        result[seg]=_get_segment_csv(seg)
+        time.sleep(1)  # 1 second gap between segment downloads
+    return result
+
 def fetch_all_lot_sizes():
     """Fetch lot sizes for ALL instruments from Dhan API. Call once after token is ready.
     Returns dict of {key: lot_size} for GUI update."""
@@ -161,15 +190,7 @@ def fetch_all_lot_sizes():
     needed_segs=set()
     for k,inst in INSTRUMENTS.items():
         needed_segs.add(inst["segment"])
-    seg_rows={}
-    for seg in needed_segs:
-        rows=[]
-        try:
-            r=requests.get(f"{DHAN_INSTRUMENT_API}/{seg}",headers=api.headers,timeout=60)
-            if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
-        except: pass
-        seg_rows[seg]=rows
-        if rows: log.info(f"  Lot fetch {seg}: {len(rows)} instruments")
+    seg_rows=_get_all_segment_csvs(needed_segs)
     result={}
     for key,inst in INSTRUMENTS.items():
         rows=seg_rows.get(inst["segment"],[])
@@ -223,14 +244,7 @@ def resolve_instruments(keys):
     today=datetime.now(IST).date()
     needed_segs=set()
     for k in keys: needed_segs.add(INSTRUMENTS[k]["segment"])
-    seg_rows={}
-    for seg in needed_segs:
-        rows=[]
-        try:
-            r=requests.get(f"{DHAN_INSTRUMENT_API}/{seg}",headers=api.headers,timeout=60)
-            if r.status_code==200 and len(r.text)>100: rows=list(csv.DictReader(io.StringIO(r.text)))
-        except: pass
-        seg_rows[seg]=rows
+    seg_rows=_get_all_segment_csvs(needed_segs)
     for key in keys:
         inst=INSTRUMENTS.get(key)
         if not inst: continue

@@ -2,7 +2,7 @@
 app.py -- Balfund Renko Trading System v3.2
 Light theme, auto lot size on token, STOP != squareoff, Total Qty live calc
 """
-import sys,os,threading,time,json,logging,re
+import sys,os,threading,time,json,logging,re,struct
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
 import customtkinter as ctk
@@ -38,7 +38,7 @@ class App(ctk.CTk):
         self.ws_thread=None;self.ws_stop=threading.Event()
         self.signal_secid_to_key={};self.trade_secid_to_key={}
         self.engines={};self.trade_managers={};self.running_keys=set()
-        self.client_id="";self.access_token="";self._chart_counts={};self._sq_done=False
+        self.client_id="";self.access_token="";self._chart_counts={};self._sq_done=False;self._ws_tick_count=0
         if ENV_FILE.exists(): load_dotenv(str(ENV_FILE),override=True)
         self._build_ui();self._load_creds();self._start_timers()
 
@@ -302,26 +302,42 @@ class App(ctk.CTk):
 
     def _ws_loop(self):
         url=f"wss://api-feed.dhan.co?version=2&token={self.access_token}&clientId={self.client_id}&authType=2"
-        backoff=0;connect_time=0
+        delay=3;connect_time=0;ticks_at_open=0;instant_fails=0
+        DISC_REASONS={805:"Max connections exceeded",806:"Subscribe limit",807:"Server error",808:"Token expired",809:"Client ID mismatch",810:"Invalid token"}
         while not self.ws_stop.is_set():
-            # Sleep if no instruments running (don't hammer Dhan with empty connections)
             if not self.running_keys:
                 time.sleep(5);continue
             try:
                 def _open(ws):
-                    nonlocal connect_time;self.ws_connected.set();connect_time=time.time()
+                    nonlocal connect_time,ticks_at_open
+                    self.ws_connected.set();connect_time=time.time();ticks_at_open=self._ws_tick_count
                     insts=[]
                     for k in list(self.running_keys):
                         sid,seg,_=get_signal_config(k)
                         if sid: insts.append({"ExchangeSegment":seg,"SecurityId":sid})
-                    if insts: ws.send(json.dumps({"RequestCode":REQ_SUB_TICKER,"InstrumentCount":len(insts),"InstrumentList":insts}))
+                    for i in range(0,max(len(insts),1),100):
+                        batch=insts[i:i+100]
+                        if batch: ws.send(json.dumps({"RequestCode":REQ_SUB_TICKER,"InstrumentCount":len(batch),"InstrumentList":batch}))
+                        if i+100<len(insts): time.sleep(0.1)
                     self.after(0,lambda:self._dlog(f"WS connected | {len(insts)} signals"))
                 def _msg(ws,message):
                     if isinstance(message,str): return
-                    hdr=parse_header_8(bytes(message))
+                    b=bytes(message)
+                    if len(b)<8: return
+                    code=b[0]
+                    if code==50:
+                        if len(b)>=10:
+                            rc=int(struct.unpack_from("<H",b,8)[0])
+                            desc=DISC_REASONS.get(rc,f"Unknown({rc})")
+                            self.after(0,lambda:self._dlog(f"WS Dhan disconnect: {rc} - {desc}"))
+                            if rc in (806,807,808,809,810):
+                                nonlocal instant_fails;instant_fails=99
+                        return
+                    hdr=parse_header_8(b)
                     if not hdr or int(hdr["resp_code"])!=RESP_TICKER: return
                     t=parse_ticker(hdr["payload"])
                     if not t: return
+                    self._ws_tick_count+=1
                     sid=str(hdr["security_id"]);ltp=float(t["ltp"]);ltt=_norm_epoch(int(t["ltt_epoch"]))
                     ts=datetime.fromtimestamp(ltt,tz=IST)
                     key=self.signal_secid_to_key.get(sid)
@@ -333,24 +349,34 @@ class App(ctk.CTk):
                     if tk and tk in self.trade_managers: self.trade_managers[tk].update_ltp(sid,ltp)
                 def _err(ws,error):
                     err_str=str(error)
-                    # Detect 429 and set long backoff
                     if "429" in err_str:
-                        nonlocal backoff;backoff=99  # triggers 120s wait
-                    self.after(0,lambda:self._dlog(f"WS err: {error}"))
+                        nonlocal instant_fails;instant_fails=99
+                        self.after(0,lambda:self._dlog("WS 429 rate limited -- waiting 120s"))
+                    else:
+                        self.after(0,lambda:self._dlog(f"WS err: {error}"))
                 def _close(ws,sc,msg):
-                    nonlocal backoff,connect_time
+                    nonlocal delay,connect_time,instant_fails
                     self.ws_connected.clear()
-                    # Only reset backoff if connection survived 30+ seconds
-                    if connect_time>0 and (time.time()-connect_time)>=30: backoff=0
+                    life=time.time()-connect_time if connect_time else 999
+                    ticks_rx=self._ws_tick_count-ticks_at_open
+                    if life<5 and ticks_rx==0:
+                        instant_fails+=1
+                        self.after(0,lambda:self._dlog(f"WS instant disconnect #{instant_fails}"))
+                    elif life>=30 and ticks_rx>0:
+                        delay=3;instant_fails=0
                 self.ws=websocket.WebSocketApp(url,on_open=_open,on_message=_msg,on_error=_err,on_close=_close)
                 self.ws.run_forever(ping_interval=20,ping_timeout=10)
             except: pass
             finally:
                 if not self.ws_stop.is_set():
-                    if backoff>=99: delay=120  # 429 block: wait 2 minutes
-                    else: delay=min(2*(2**backoff),30)
-                    backoff=min(backoff+1,99)
-                    time.sleep(delay)
+                    if instant_fails>=99:
+                        self.after(0,lambda:self._dlog("WS blocked/fatal -- waiting 120s"))
+                        time.sleep(120);instant_fails=0;delay=3
+                    elif instant_fails>=5:
+                        self.after(0,lambda:self._dlog(f"WS {instant_fails} instant disconnects -- waiting 60s"))
+                        time.sleep(60);instant_fails=0;delay=3
+                    else:
+                        time.sleep(delay);delay=min(delay*2,60)
 
     def _ws_subscribe(self,sid,seg):
         if self.ws and self.ws_connected.is_set():
