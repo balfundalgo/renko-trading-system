@@ -87,7 +87,7 @@ class App(ctk.CTk):
             if t:
                 self.e_tok.delete(0,"end");self.e_tok.insert(0,t);set_key(str(ENV_FILE),"DHAN_ACCESS_TOKEN",t)
                 self.lb_tok.configure(text="Token OK! Fetching lot sizes...",text_color=GRN)
-                api.set_auth(t,cid);self._fetch_lots()
+                api.set_auth(t,cid);api.set_credentials(pin,ts);self._fetch_lots()
             else: self.lb_tok.configure(text="Failed",text_color=RED)
         threading.Thread(target=_g,daemon=True).start()
 
@@ -97,7 +97,7 @@ class App(ctk.CTk):
         ok=DhanTokenManager(cid,"","",t).verify(t)
         if ok:
             self.lb_tok.configure(text="Token VALID! Fetching lot sizes...",text_color=GRN)
-            api.set_auth(t,cid)
+            api.set_auth(t,cid);api.set_credentials(self.e_pin.get().strip(),self.e_totp.get().strip())
             threading.Thread(target=self._fetch_lots,daemon=True).start()
         else: self.lb_tok.configure(text="Token INVALID",text_color=RED)
 
@@ -297,6 +297,7 @@ class App(ctk.CTk):
         self.client_id=self.e_cid.get().strip();self.access_token=self.e_tok.get().strip()
         if not self.client_id or not self.access_token: self._dlog("ERROR: Generate token first!");return False
         api.set_auth(self.access_token,self.client_id)
+        api.set_credentials(self.e_pin.get().strip(),self.e_totp.get().strip())
         self.ws_stop.clear();self.ws_connected.clear()
         self.ws_thread=threading.Thread(target=self._ws_loop,daemon=True);self.ws_thread.start();return True
 

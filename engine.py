@@ -122,14 +122,40 @@ def get_signal_config(key):
     return inst["security_id"],inst["segment"],inst["instrument"]
 
 class DhanAPI:
-    def __init__(self): self.headers={}
+    def __init__(self):
+        self.headers={};self.client_id="";self.pin="";self.totp_secret=""
+        self._refresh_lock=threading.Lock();self._last_refresh=0
     def set_auth(self,token,client_id):
         self.headers={"Content-Type":"application/json","Accept":"application/json","access-token":token,"client-id":client_id}
+        self.client_id=client_id
+    def set_credentials(self,pin,totp_secret):
+        """Store credentials for auto-refresh on 401."""
+        self.pin=pin;self.totp_secret=totp_secret
+    def _try_refresh(self):
+        """Attempt token refresh. Returns True if successful. Thread-safe, max once per 60s."""
+        with self._refresh_lock:
+            if time.time()-self._last_refresh<60: return False  # already tried recently
+            if not self.pin or not self.totp_secret: log.warning("  No credentials for auto-refresh");return False
+            log.info("  TOKEN EXPIRED — auto-refreshing...")
+            mgr=DhanTokenManager(self.client_id,self.pin,self.totp_secret)
+            new_token=mgr.generate()
+            if new_token:
+                self.headers["access-token"]=new_token
+                self._last_refresh=time.time()
+                # Save to .env
+                try: set_key(str(ENV_FILE),"DHAN_ACCESS_TOKEN",new_token)
+                except: pass
+                log.info("  Token refreshed OK")
+                return True
+            log.error("  Token refresh FAILED")
+            return False
     def post(self,ep,payload,retries=2):
         for a in range(retries+1):
             try:
                 r=requests.post(f"{BASE_URL}{ep}",headers=self.headers,json=payload,timeout=15)
                 if r.status_code==200: return r.json()
+                if r.status_code==401 and a==0:
+                    if self._try_refresh(): continue
                 log.warning(f"API {ep}->{r.status_code}: {r.text[:200]}")
             except Exception as e: log.error(f"API {ep}: {e}")
             if a<retries: time.sleep(1)
@@ -139,6 +165,8 @@ class DhanAPI:
             try:
                 r=requests.get(f"{BASE_URL}{ep}",headers=self.headers,timeout=15)
                 if r.status_code==200: return r.json()
+                if r.status_code==401 and a==0:
+                    if self._try_refresh(): continue
             except: pass
             if a<retries: time.sleep(1)
         return None
